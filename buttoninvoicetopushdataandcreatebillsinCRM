@@ -1,0 +1,300 @@
+
+invoiceID = invoice.get("invoice_id");
+customerID = invoice.get("customer_id");
+crmPotenID = invoice.get("zcrm_potential_id");
+resultMap = Map();
+getCustomFields = invoice.get("custom_fields");
+designerCompany = "";
+designerID = "";
+designCom = 0.0;
+isSmart = false;
+for each  ele in getCustomFields
+{
+	if(ele.get("api_name") == "cf_designer_company")
+	{
+		designerCompany = ele.get("value");
+	}
+	if(ele.get("api_name") == "cf_designer")
+	{
+		designerID = ele.get("value");
+	}
+	if(ele.get("api_name") == "cf_smart")
+	{
+		isSmart = ele.get("value") == true;
+	}
+}
+// Get designer commission %
+if(designerID != "")
+{
+	getVendorRec = invokeurl
+	[
+		url :"https://www.zohoapis.com/books/v3/contacts/" + designerID + "?organization_id=857779576"
+		type :GET
+		connection:"books"
+	];
+	getVendorDet = getVendorRec.get("contact");
+	if(getVendorDet != null)
+	{
+		getCustomFieldsVendor = getVendorDet.get("custom_fields");
+		for each  ven in getCustomFieldsVendor
+		{
+			if(ven.get("api_name") == "cf_comission")
+			{
+				designCom = ifnull(ven.get("value"),0.0).toDecimal();
+			}
+		}
+	}
+}
+comVal = "";
+contactID = "";
+if(designerCompany != null && designerCompany != "")
+{
+	encoded_name = encodeUrl(designerCompany);
+	responseSearch = zoho.books.getRecords("contacts","857779576","contact_name=" + encoded_name,"books");
+	contactsList = responseSearch.get("contacts");
+	if(contactsList != null && contactsList.size() == 1)
+	{
+		contactID = contactsList.get(0).get("contact_id");
+		responseSearchCompDet = zoho.books.getRecords("contacts","857779576","contact_id=" + contactID,"books");
+		getCompDetList = responseSearchCompDet.get("contacts");
+		if(getCompDetList != null && getCompDetList.size() > 0)
+		{
+			getCustFieldCompany = getCompDetList.get(0).get("custom_fields");
+			for each  com in getCustFieldCompany
+			{
+				if(com.get("api_name") == "cf_comission")
+				{
+					comVal = ifnull(com.get("value"),"0");
+				}
+			}
+		}
+	}
+}
+// Get total rebate (unrebated payments)
+getPaymentReceivedRec = invokeurl
+[
+	url :"https://www.zohoapis.com/books/v3/invoices/" + invoiceID.toString() + "/payments?organization_id=857779576"
+	type :GET
+	connection:"books"
+];
+getPayment = getPaymentReceivedRec.get("payments");
+unrebatedPayments = List();
+totalRebate = 0.0;
+for each  pay in getPayment
+{
+	payID = pay.get("payment_id");
+	getPaymentCustomFields = invokeurl
+	[
+		url :"https://www.zohoapis.com/books/v3/customerpayments/" + payID + "?organization_id=857779576"
+		type :GET
+		connection:"books"
+	];
+	paymentCustom = getPaymentCustomFields.get("payment");
+	paymentCustomFields = paymentCustom.get("custom_fields");
+	cf_bills = "";
+	cf_bills_rebate = "";
+	for each  field in paymentCustomFields
+	{
+		if(field.get("api_name") == "cf_bills_rebate")
+		{
+			cf_bills_rebate = field.get("value");
+		}
+		if(field.get("api_name") == "cf_bills")
+		{
+			cf_bills = field.get("value");
+		}
+	}
+	if((cf_bills == null || cf_bills == "") && (cf_bills_rebate == null || cf_bills_rebate == ""))
+	{
+		unrebatedPayments.add(payID);
+		amount = paymentCustom.get("amount");
+		if(amount != null)
+		{
+			totalRebate = totalRebate + amount.toDecimal();
+		}
+	}
+}
+// Calculate base
+baseAmount = totalRebate;
+if(isSmart)
+{
+	baseAmount = totalRebate * 0.05;
+}
+// Create bill for rebate company
+if(unrebatedPayments.size() > 0 && designerCompany != null && designerCompany != "" && comVal != null && comVal != "")
+{
+	commissionPercent = comVal.toDecimal();
+	commissionAmount = (baseAmount * commissionPercent) / 100;
+	if(commissionAmount > 0)
+	{
+		randomSuffix = zoho.currenttime.toLong().toString().getSuffix(5);
+		lineItem = Map();
+		lineItem.put("item_id","5329259000003618001");
+		lineItem.put("account_id","5329259000003598853");
+		lineItem.put("rate",commissionAmount);
+		lineItem.put("quantity",1);
+		lineItem.put("customer_id",customerID);
+		lineItemList = List();
+		lineItemList.add(lineItem);
+		bill_data = Map();
+		bill_data.put("vendor_id",contactID);
+		bill_data.put("bill_number","REBATE-" + invoiceID + "-" + randomSuffix);
+		bill_data.put("line_items",lineItemList);
+		createBillResponse = invokeurl
+		[
+			url :"https://www.zohoapis.com/books/v3/bills?organization_id=857779576"
+			type :POST
+			parameters:bill_data.toString()
+			connection:"books"
+		];
+		billResponseMap = createBillResponse.toMap();
+		createdBill = billResponseMap.get("bill");
+		if(createdBill != null && createdBill.get("bill_id") != null)
+		{
+			billID = createdBill.get("bill_id");
+			for each  unpaidID in unrebatedPayments
+			{
+				updateMap = Map();
+				customFieldUpdate = Map();
+				customFieldUpdate.put("api_name","cf_bills_rebate");
+				customFieldUpdate.put("value",billID);
+				customFieldsList = List();
+				customFieldsList.add(customFieldUpdate);
+				updateMap.put("custom_fields",customFieldsList);
+				updatePayment = invokeurl
+				[
+					url :"https://www.zohoapis.com/books/v3/customerpayments/" + unpaidID + "?organization_id=857779576"
+					type :PUT
+					parameters:updateMap.toString()
+					connection:"books"
+				];
+			}
+			// Sync Rebate Bill to CRM
+			response = invokeurl
+			[
+				url :"https://www.zohoapis.com/books/v3/bills/" + billID + "?organization_id=857779576"
+				type :GET
+				connection:"books"
+			];
+			bill = response.get("bill");
+			subformList = List();
+			for each  line in bill.get("line_items")
+			{
+				row = Map();
+				row.put("Item_Details",line.get("name"));
+				row.put("Quantity",line.get("quantity"));
+				row.put("Rate",line.get("rate"));
+				row.put("Account",line.get("account_name"));
+				row.put("Customer_Details",line.get("customer_name"));
+				subformList.add(row);
+			}
+			datamap = Map();
+			datamap.put("Bill_Status",bill.get("status"));
+			datamap.put("Item_Table",subformList);
+			datamap.put("Bill_Number",bill.get("bill_number"));
+			datamap.put("Vendor_Name",bill.get("vendor_name"));
+			datamap.put("Bill_Date",bill.get("date"));
+			datamap.put("Bill_ID_Zoho_Books",bill.get("bill_id"));
+			datamap.put("Deals",crmPotenID);
+			createResult = zoho.crm.createRecord("Bills",datamap,{"trigger":{}},"zohocrm");
+			getCRMID = createResult.get("id");
+			CFs = List();
+			CF1 = Map();
+			CF1.put("label","Zoho CRM ID");
+			CF1.put("value",getCRMID);
+			CFs.add(CF1);
+			jsonMap = Map();
+			jsonMap.put("custom_fields",CFs);
+			updateBills = zoho.books.updateRecord("bills",857779576,billID,jsonMap,"books");
+		}
+	}
+}
+// Create bill for designer
+if(unrebatedPayments.size() > 0 && designerID != "" && designCom != null && designCom > 0)
+{
+	designerCommissionAmount = (baseAmount * designCom) / 100;
+	if(designerCommissionAmount > 0)
+	{
+		randomSuffix2 = zoho.currenttime.toLong().toString().getSuffix(5);
+		lineItem2 = Map();
+		lineItem2.put("item_id","5329259000000974436");
+		lineItem2.put("account_id","5329259000000883168");
+		lineItem2.put("rate",designerCommissionAmount);
+		lineItem2.put("quantity",1);
+		lineItem2.put("customer_id",customerID);
+		lineItemList2 = List();
+		lineItemList2.add(lineItem2);
+		bill_data2 = Map();
+		bill_data2.put("vendor_id",designerID);
+		bill_data2.put("bill_number","DESIGNER-" + invoiceID + "-" + randomSuffix2);
+		bill_data2.put("line_items",lineItemList2);
+		createBillResponse2 = invokeurl
+		[
+			url :"https://www.zohoapis.com/books/v3/bills?organization_id=857779576"
+			type :POST
+			parameters:bill_data2.toString()
+			connection:"books"
+		];
+		billResponseMap2 = createBillResponse2.toMap();
+		createdBill2 = billResponseMap2.get("bill");
+		if(createdBill2 != null && createdBill2.get("bill_id") != null)
+		{
+			billID2 = createdBill2.get("bill_id");
+			for each  unpaidID2 in unrebatedPayments
+			{
+				updateMap2 = Map();
+				customFieldUpdate2 = Map();
+				customFieldUpdate2.put("api_name","cf_bills");
+				customFieldUpdate2.put("value",billID2);
+				customFieldsList2 = List();
+				customFieldsList2.add(customFieldUpdate2);
+				updateMap2.put("custom_fields",customFieldsList2);
+				updatePayment2 = invokeurl
+				[
+					url :"https://www.zohoapis.com/books/v3/customerpayments/" + unpaidID2 + "?organization_id=857779576"
+					type :PUT
+					parameters:updateMap2.toString()
+					connection:"books"
+				];
+			}
+			// Sync Designer Bill to CRM
+			response = invokeurl
+			[
+				url :"https://www.zohoapis.com/books/v3/bills/" + billID2 + "?organization_id=857779576"
+				type :GET
+				connection:"books"
+			];
+			bill = response.get("bill");
+			subformList = List();
+			for each  line in bill.get("line_items")
+			{
+				row = Map();
+				row.put("Item_Details",line.get("name"));
+				row.put("Quantity",line.get("quantity"));
+				row.put("Rate",line.get("rate"));
+				row.put("Account",line.get("account_name"));
+				row.put("Customer_Details",line.get("customer_name"));
+				subformList.add(row);
+			}
+			datamap = Map();
+			datamap.put("Bill_Status",bill.get("status"));
+			datamap.put("Item_Table",subformList);
+			datamap.put("Bill_Number",bill.get("bill_number"));
+			datamap.put("Vendor_Name",bill.get("vendor_name"));
+			datamap.put("Bill_Date",bill.get("date"));
+			datamap.put("Bill_ID_Zoho_Books",bill.get("bill_id"));
+			datamap.put("Deals",crmPotenID);
+			createResult = zoho.crm.createRecord("Bills",datamap,{"trigger":{}},"zohocrm");
+			getCRMID = createResult.get("id");
+			CFs = List();
+			CF1 = Map();
+			CF1.put("label","Zoho CRM ID");
+			CF1.put("value",getCRMID);
+			CFs.add(CF1);
+			jsonMap = Map();
+			jsonMap.put("custom_fields",CFs);
+			updateBills = zoho.books.updateRecord("bills",857779576,billID2,jsonMap,"books");
+		}
+	}
+}
+return resultMap;

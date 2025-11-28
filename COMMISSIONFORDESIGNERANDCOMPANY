@@ -1,0 +1,316 @@
+
+invoiceID = invoice.get("invoice_id");
+invoicenumber = invoice.get("invoice_number");
+customerID = invoice.get("customer_id");
+crmPotenID = invoice.get("zcrm_potential_id");
+resultMap = Map();
+getCustomFields = invoice.get("custom_fields");
+designerCompany = "";
+designerID = "";
+designCom = 0.0;
+isSmart = false;
+// NEW FLAGS
+rebateToCompany = false;
+designerCommissionFlag = false;
+for each  ele in getCustomFields
+{
+	if(ele.get("api_name") == "cf_designer_company")
+	{
+		designerCompany = ele.get("value");
+	}
+	if(ele.get("api_name") == "cf_designer")
+	{
+		designerID = ele.get("value");
+	}
+	if(ele.get("api_name") == "cf_smart")
+	{
+		isSmart = ele.get("value") == true;
+	}
+	if(ele.get("api_name") == "cf_rebate_to_company")
+	{
+		rebateToCompany = ele.get("value") == true;
+	}
+	if(ele.get("api_name") == "cf_designer_commission")
+	{
+		designerCommissionFlag = ele.get("value") == true;
+	}
+}
+// Get designer commission %
+if(designerID != "")
+{
+	getVendorRec = invokeurl
+	[
+		url :"https://www.zohoapis.com/books/v3/contacts/" + designerID + "?organization_id=857779576"
+		type :GET
+		connection:"books"
+	];
+	getVendorDet = getVendorRec.get("contact");
+	if(getVendorDet != null)
+	{
+		getCustomFieldsVendor = getVendorDet.get("custom_fields");
+		for each  ven in getCustomFieldsVendor
+		{
+			if(ven.get("api_name") == "cf_comission")
+			{
+				designCom = ifnull(ven.get("value"),0.0).toDecimal();
+			}
+		}
+	}
+}
+// Get company commission %
+comVal = "";
+contactID = "";
+if(designerCompany != null && designerCompany != "")
+{
+	encoded_name = encodeUrl(designerCompany);
+	responseSearch = zoho.books.getRecords("contacts","857779576","contact_name=" + encoded_name,"books");
+	contactsList = responseSearch.get("contacts");
+	if(contactsList != null && contactsList.size() == 1)
+	{
+		contactID = contactsList.get(0).get("contact_id");
+		responseSearchCompDet = zoho.books.getRecords("contacts","857779576","contact_id=" + contactID,"books");
+		getCompDetList = responseSearchCompDet.get("contacts");
+		if(getCompDetList != null && getCompDetList.size() > 0)
+		{
+			getCustFieldCompany = getCompDetList.get(0).get("custom_fields");
+			for each  com in getCustFieldCompany
+			{
+				if(com.get("api_name") == "cf_comission")
+				{
+					comVal = ifnull(com.get("value"),"0");
+				}
+			}
+		}
+	}
+}
+// Get total rebate
+getPaymentReceivedRec = invokeurl
+[
+	url :"https://www.zohoapis.com/books/v3/invoices/" + invoiceID.toString() + "/payments?organization_id=857779576"
+	type :GET
+	connection:"books"
+];
+getPayment = getPaymentReceivedRec.get("payments");
+unrebatedPayments = List();
+totalRebate = 0.0;
+for each  pay in getPayment
+{
+	payID = pay.get("payment_id");
+	getPaymentCustomFields = invokeurl
+	[
+		url :"https://www.zohoapis.com/books/v3/customerpayments/" + payID + "?organization_id=857779576"
+		type :GET
+		connection:"books"
+	];
+	paymentCustom = getPaymentCustomFields.get("payment");
+	paymentNumber = paymentCustom.get("payment_number");
+	paymentCustomFields = paymentCustom.get("custom_fields");
+	cf_bills = "";
+	cf_bills_rebate = "";
+	for each  field in paymentCustomFields
+	{
+		if(field.get("api_name") == "cf_bills_rebate")
+		{
+			cf_bills_rebate = field.get("value");
+		}
+		if(field.get("api_name") == "cf_bills")
+		{
+			cf_bills = field.get("value");
+		}
+	}
+	if((cf_bills == "" || cf_bills == null) && (cf_bills_rebate == "" || cf_bills_rebate == null))
+	{
+		unrebatedPayments.add(payID);
+		amount = paymentCustom.get("amount");
+		if(amount != null)
+		{
+			totalRebate = totalRebate + amount.toDecimal();
+		}
+	}
+}
+// Base logic
+baseAmount = totalRebate;
+rebateCompanyAmount = 0.0;
+designerAmount = 0.0;
+if(isSmart)
+{
+	baseAmount = totalRebate * 0.05;
+	if(isnull(comVal) || comVal.trim() == "" || !isNumber(comVal))
+	{
+		comValDec = 0.0;
+	}
+	else
+	{
+		comValDec = comVal.toDecimal();
+	}
+	designComDec = ifnull(designCom,0.0);
+	if(comValDec == 0)
+	{
+		rebateCompanyAmount = 0.0;
+		designerAmount = baseAmount;
+	}
+	else
+	{
+		totalRatio = comValDec + designComDec;
+		compSplitPercent = comValDec / totalRatio * 100;
+		designerSplitPercent = designComDec / totalRatio * 100;
+		rebateCompanyAmount = (baseAmount * compSplitPercent) / 100;
+		designerAmount = (baseAmount * designerSplitPercent) / 100;
+	}
+}
+else
+{
+	baseAmount = totalRebate;
+	if(comVal != null && comVal != "" && isNumber(comVal))
+	{
+		comValDec = comVal.toDecimal();
+	}
+	else
+	{
+		comValDec = 0.0;
+	}
+	if(comValDec == 0)
+	{
+		rebateCompanyAmount = 0.0;
+		designerAmount = (baseAmount * designCom) / 100;
+	}
+	else
+	{
+		rebateCompanyAmount = (baseAmount * comValDec) / 100;
+		if(designCom > 0)
+		{
+			designerAmount = (baseAmount * designCom) / 100;
+		}
+	}
+}
+// ************** FINAL OVERRIDE LOGIC ***************
+// totalPayout = rebateCompanyAmount + designerAmount;
+// SMART override
+if(isSmart == true && rebateToCompany == true && designerCommissionFlag == false)
+{
+	baseAmount = totalRebate * 0.05;
+	rebateCompanyAmount = baseAmount;
+	designerAmount = 0;
+}
+if(isSmart == true && rebateToCompany == false && designerCommissionFlag == true)
+{
+	baseAmount = totalRebate * 0.05;
+	designerAmount = baseAmount;
+	rebateCompanyAmount = 0;
+}
+else
+{
+	// NON-SMART LOGIC A
+	if(rebateToCompany == true && designerCommissionFlag == false)
+	{
+		// 		rebateCompanyAmount = totalPayout;
+		designerAmount = 0;
+	}
+	// NON-SMART LOGIC B
+	if(rebateToCompany == false && designerCommissionFlag == true)
+	{
+		// 		designerAmount = totalPayout;
+		rebateCompanyAmount = 0;
+	}
+}
+// ------------------ CREATE COMPANY BILL ------------------
+// NEW FIX: BLOCK company bill if DesignerCommission = TRUE & RebateToCompany = FALSE
+if(unrebatedPayments.size() > 0 && designerCompany != null && designerCompany != "" && rebateCompanyAmount > 0 && !(designerCommissionFlag == true && rebateToCompany == false))
+{
+	randomSuffix = zoho.currenttime.toLong().toString().getSuffix(5);
+	lineItem = Map();
+	lineItem.put("item_id","5329259000003618001");
+	lineItem.put("account_id","5329259000003598853");
+	lineItem.put("rate",rebateCompanyAmount);
+	lineItem.put("description",comVal + "-" + invoicenumber + "-" + paymentNumber);
+	lineItem.put("quantity",1);
+	lineItem.put("customer_id",customerID);
+	lineItemList = List();
+	lineItemList.add(lineItem);
+	bill_data = Map();
+	bill_data.put("vendor_id",contactID);
+	bill_data.put("reference_number",invoicenumber);
+	bill_data.put("bill_number","REBATE-" + comVal + "-" + invoicenumber + "-" + paymentNumber);
+	bill_data.put("line_items",lineItemList);
+	createBillResponse = invokeurl
+	[
+		url :"https://www.zohoapis.com/books/v3/bills?organization_id=857779576"
+		type :POST
+		parameters:bill_data.toString()
+		connection:"books"
+	];
+	billResponseMap = createBillResponse.toMap();
+	createdBill = billResponseMap.get("bill");
+	if(createdBill != null && createdBill.get("bill_id") != null)
+	{
+		billID = createdBill.get("bill_id");
+		for each  unpaidID in unrebatedPayments
+		{
+			updateMap = Map();
+			customFieldUpdate = Map();
+			customFieldUpdate.put("api_name","cf_bills_rebate");
+			customFieldUpdate.put("value",billID);
+			customFieldsList = List();
+			customFieldsList.add(customFieldUpdate);
+			updateMap.put("custom_fields",customFieldsList);
+			updatePayment = invokeurl
+			[
+				url :"https://www.zohoapis.com/books/v3/customerpayments/" + unpaidID + "?organization_id=857779576"
+				type :PUT
+				parameters:updateMap.toString()
+				connection:"books"
+			];
+		}
+	}
+}
+// ------------------ CREATE DESIGNER BILL ------------------
+// BLOCK designer bill when RebateToCompany = TRUE & DesignerCommission = FALSE
+if(unrebatedPayments.size() > 0 && designerID != "" && designerAmount > 0 && !(rebateToCompany == true && designerCommissionFlag == false))
+{
+	randomSuffix2 = zoho.currenttime.toLong().toString().getSuffix(5);
+	lineItem2 = Map();
+	lineItem2.put("item_id","5329259000000974436");
+	lineItem2.put("account_id","5329259000000883168");
+	lineItem2.put("rate",designerAmount);
+	lineItem2.put("description",designCom + "-" + invoicenumber + "-" + paymentNumber);
+	lineItem2.put("quantity",1);
+	lineItem2.put("customer_id",customerID);
+	lineItemList2 = List();
+	lineItemList2.add(lineItem2);
+	bill_data2 = Map();
+	bill_data2.put("vendor_id",designerID);
+	bill_data2.put("reference_number",invoicenumber);
+	bill_data2.put("bill_number","DESIGNER-" + designCom + "-" + invoicenumber + "-" + paymentNumber);
+	bill_data2.put("line_items",lineItemList2);
+	createBillResponse2 = invokeurl
+	[
+		url :"https://www.zohoapis.com/books/v3/bills?organization_id=857779576"
+		type :POST
+		parameters:bill_data2.toString()
+		connection:"books"
+	];
+	billResponseMap2 = createBillResponse2.toMap();
+	createdBill2 = billResponseMap2.get("bill");
+	if(createdBill2 != null && createdBill2.get("bill_id") != null)
+	{
+		billID2 = createdBill2.get("bill_id");
+		for each  unpaidID2 in unrebatedPayments
+		{
+			updateMap2 = Map();
+			customFieldUpdate2 = Map();
+			customFieldUpdate2.put("api_name","cf_bills");
+			customFieldUpdate2.put("value",billID2);
+			customFieldsList2 = List();
+			customFieldsList2.add(customFieldUpdate2);
+			updateMap2.put("custom_fields",customFieldsList2);
+			updatePayment2 = invokeurl
+			[
+				url :"https://www.zohoapis.com/books/v3/customerpayments/" + unpaidID2 + "?organization_id=857779576"
+				type :PUT
+				parameters:updateMap2.toString()
+				connection:"books"
+			];
+		}
+	}
+}
+return resultMap;
